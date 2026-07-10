@@ -72,7 +72,7 @@ class MouseJiggler {
       const dy = Math.round(yNext - y)
 
       const report = this.mouseReport.buildReport(dx, dy, 0)
-      await window.electron.ipcRenderer.invoke(IpcEvents.SEND_MOUSE, [0x01, report])
+      await window.electron.ipcRenderer.invoke(IpcEvents.SEND_MOUSE, [0x01, ...report])
 
       this.figure8Step = (this.figure8Step + 1) % this.FIGURE8_STEPS
     }
