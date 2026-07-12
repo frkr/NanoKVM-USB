@@ -19,13 +19,21 @@ function createWindow(): void {
     ...(process.platform === 'linux' ? { icon } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false
+      sandbox: false,
+      // Keep the capture canvas (rAF-driven) updating when the window is not
+      // focused — a KVM is often in the background while you use the target.
+      backgroundThrottling: false
     }
   })
 
   mainWindow.on('ready-to-show', () => {
     mainWindow.maximize()
     mainWindow.show()
+  })
+
+  // TEMP (Phase 1 debug): surface renderer console in the terminal
+  mainWindow.webContents.on('console-message', (_e, _lvl, message) => {
+    if (/capture|webgl|port|gl error/i.test(message)) console.log('[renderer]', message)
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
@@ -54,6 +62,7 @@ app.whenReady().then(() => {
 
   events.registerApp()
   events.registerSerialPort()
+  events.registerCapture()
 
   createWindow()
 

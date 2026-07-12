@@ -64,6 +64,7 @@ async function closeSerialPort(): Promise<boolean> {
 }
 
 async function sendKeyboard(_: IpcMainInvokeEvent, report: number[]): Promise<void> {
+  console.log('[input] SEND_KEYBOARD')
   try {
     await device.sendKeyboardData(report)
   } catch (error) {
@@ -71,7 +72,9 @@ async function sendKeyboard(_: IpcMainInvokeEvent, report: number[]): Promise<vo
   }
 }
 
+let mouseLog = 0
 async function sendMouse(_: IpcMainInvokeEvent, report: number[]): Promise<void> {
+  if (mouseLog++ % 30 === 0) console.log('[input] SEND_MOUSE x30')
   try {
     await device.sendMouseData(report)
   } catch (error) {

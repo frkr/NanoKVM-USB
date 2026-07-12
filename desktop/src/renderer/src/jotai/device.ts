@@ -12,6 +12,10 @@ export const resolutionAtom = atom<Resolution>({
 
 export const videoScaleAtom = atom<number>(1.0)
 
+// Experimental: capture the device uncompressed (YUY2) via FFmpeg instead of
+// getUserMedia (which forces MJPEG). macOS only for now.
+export const captureModeAtom = atom<boolean>(false)
+
 export const videoDeviceIdAtom = atom('')
 export const videoStateAtom = atom<VideoState>('disconnected')
 
