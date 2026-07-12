@@ -11,6 +11,7 @@ import type { MessagePortMain } from 'electron'
 
 export type CaptureDevice = { index: number; name: string }
 export type CaptureOptions = {
+  deviceName?: string
   deviceIndex?: number
   width: number
   height: number
@@ -24,7 +25,8 @@ export type ResolvedCapture = { device: string; width: number; height: number; f
 
 const HELPER_CANDIDATES = [
   process.env.NANOKVM_CAPTURE_PATH,
-  join(__dirname, '../../resources/nanokvm-capture')
+  // packaged: resources/ is asarUnpacked (binaries can't execute from asar)
+  join(__dirname, '../../resources/nanokvm-capture').replace('app.asar', 'app.asar.unpacked')
 ].filter(Boolean) as string[]
 
 function helperPath(): string {
@@ -73,8 +75,9 @@ function autoPick(devices: HelperDevice[]): string {
  */
 export async function resolveCapture(opts: CaptureOptions): Promise<ResolvedCapture> {
   const devices = await listAll()
+  const byName = opts.deviceName ? devices.find((d) => d.name === opts.deviceName) : undefined
   const byIndex = opts.deviceIndex !== undefined ? devices[opts.deviceIndex] : undefined
-  const device = byIndex ? byIndex.name : autoPick(devices)
+  const device = byName?.name || byIndex?.name || autoPick(devices)
   if (!device) throw new Error('no capture device found')
 
   const modes = new Map<string, Mode>()
@@ -131,7 +134,6 @@ export class CaptureSession {
       '--fps',
       String(opts.fps)
     ]
-    console.log('[capture] spawn helper', args.join(' '))
     const proc = spawn(helperPath(), args)
     this.proc = proc
 
@@ -208,7 +210,6 @@ export class CaptureSession {
           clearTimeout(startupTimeout)
           try {
             const { width, height } = JSON.parse(meta[1])
-            console.log('[capture] actual mode', width, 'x', height)
             attachPump(width, height)
             resolve({ width, height })
           } catch (e) {
@@ -218,11 +219,9 @@ export class CaptureSession {
           return
         }
         stderr += text
-        console.error('[capture][helper]', text.trim())
       })
 
-      proc.on('close', (code) => {
-        console.log('[capture] helper closed code=', code, 'frames=', seq)
+      proc.on('close', () => {
         const wasCurrent = this.proc === proc
         if (wasCurrent) this.proc = null
         clearTimeout(startupTimeout)

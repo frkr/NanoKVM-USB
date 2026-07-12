@@ -3,9 +3,11 @@ import { Popover } from 'antd'
 import { MonitorIcon } from 'lucide-react'
 
 import { Capture } from './capture'
+import { CaptureDevice } from './capture-device'
 import { Device } from './device'
 import { Resolution } from './resolution'
 import { Scale } from './scale'
+import { Sharpness } from './sharpness'
 
 export const Video = (): ReactElement => {
   const content = (
@@ -13,6 +15,8 @@ export const Video = (): ReactElement => {
       <Resolution />
       <Scale />
       <Capture />
+      <CaptureDevice />
+      <Sharpness />
       <Device />
     </div>
   )

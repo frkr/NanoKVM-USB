@@ -28,7 +28,6 @@ async function startCapture(e: IpcMainInvokeEvent, opts: CaptureOptions): Promis
   // ACTUAL delivered dimensions once the stream starts (the UVC stack may serve
   // the signal-native mode regardless of the request).
   const resolved = await resolveCapture(opts)
-  console.log('[capture] requested', opts, '-> resolved', resolved)
 
   const { port1, port2 } = new MessageChannelMain()
   port1.start()

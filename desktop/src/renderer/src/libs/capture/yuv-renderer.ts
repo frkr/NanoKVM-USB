@@ -29,7 +29,7 @@ void main(){
 // Catmull-Rom bicubic via 9 bilinear fetches (Jimenez).
 const FRAG_SCALE = `#version 300 es
 precision highp float;
-uniform sampler2D tex; uniform vec2 uSrcSize; uniform vec2 uOutSize;
+uniform sampler2D tex; uniform vec2 uSrcSize; uniform vec2 uOutSize; uniform float uSharp;
 out vec4 frag;
 vec4 catmullRom(vec2 uv){
   vec2 samplePos = uv * uSrcSize;
@@ -70,11 +70,11 @@ void main(){
   vec3 mn = min(min(min(n, s), min(e, w)), c);
   vec3 mx = max(max(max(n, s), max(e, w)), c);
   vec3 amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0));
-  float sharpness = 0.5;                       // 0..1
-  vec3 wgt = amp * (-1.0 / mix(8.0, 5.0, sharpness));
+  vec3 wgt = amp * (-1.0 / 5.0);
   vec3 outc = ((n + s + e + w) * wgt + c) / (4.0 * wgt + 1.0);
 
-  frag = vec4(clamp(outc, 0.0, 1.0), 1.0);
+  // uSharp 0..1 blends from unsharpened to full-strength CAS.
+  frag = vec4(clamp(mix(c, outc, uSharp), 0.0, 1.0), 1.0);
 }`
 
 export class YuvRenderer {
@@ -84,6 +84,8 @@ export class YuvRenderer {
   private progScale: WebGLProgram | null = null
   private uSrcSize: WebGLUniformLocation | null = null
   private uOutSize: WebGLUniformLocation | null = null
+  private uSharp: WebGLUniformLocation | null = null
+  private sharpness = 0.5
   private tex: WebGLTexture | null = null
   private rgbTex: WebGLTexture | null = null
   private fbo: WebGLFramebuffer | null = null
@@ -116,6 +118,7 @@ export class YuvRenderer {
     gl.uniform1i(gl.getUniformLocation(this.progScale, 'tex'), 0)
     this.uSrcSize = gl.getUniformLocation(this.progScale, 'uSrcSize')
     this.uOutSize = gl.getUniformLocation(this.progScale, 'uOutSize')
+    this.uSharp = gl.getUniformLocation(this.progScale, 'uSharp')
     gl.uniform2f(this.uSrcSize, width, height)
 
     // Source YUY2 texture (integer, exact texel reads in the shader).
@@ -191,30 +194,13 @@ export class YuvRenderer {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     gl.viewport(0, 0, outW, outH)
     gl.uniform2f(this.uOutSize, outW, outH)
+    gl.uniform1f(this.uSharp, this.sharpness)
     gl.bindTexture(gl.TEXTURE_2D, this.rgbTex)
     gl.drawArrays(gl.TRIANGLES, 0, 3)
   }
 
-  // TEMP (debug): read back one pixel from the drawn backbuffer to prove the
-  // displayed content is actually updating. Must be called right after render()
-  // within the same rAF callback (preserveDrawingBuffer is false).
-  probe(): string {
-    const gl = this.gl
-    if (!gl) return 'no-gl'
-    if (gl.isContextLost()) return 'CONTEXT-LOST'
-    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null)
-    const px = new Uint8Array(4)
-    gl.readPixels(
-      Math.floor(gl.drawingBufferWidth / 2),
-      Math.floor(gl.drawingBufferHeight / 2),
-      1,
-      1,
-      gl.RGBA,
-      gl.UNSIGNED_BYTE,
-      px
-    )
-    const err = gl.getError()
-    return `px=${px.join(',')}${err ? ` glErr=${err}` : ''}`
+  setSharpness(value: number): void {
+    this.sharpness = Math.min(1, Math.max(0, value))
   }
 
   dispose(): void {

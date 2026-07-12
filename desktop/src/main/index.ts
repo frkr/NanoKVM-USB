@@ -31,11 +31,6 @@ function createWindow(): void {
     mainWindow.show()
   })
 
-  // TEMP (Phase 1 debug): surface renderer console in the terminal
-  mainWindow.webContents.on('console-message', (_e, _lvl, message) => {
-    if (/capture|webgl|port|gl error/i.test(message)) console.log('[renderer]', message)
-  })
-
   mainWindow.webContents.setWindowOpenHandler((details) => {
     shell.openExternal(details.url)
     return { action: 'deny' }

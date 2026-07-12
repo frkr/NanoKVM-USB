@@ -12,15 +12,17 @@ import { Menu } from '@renderer/components/menu'
 import { Mouse } from '@renderer/components/mouse'
 import { VirtualKeyboard } from '@renderer/components/virtual-keyboard'
 import {
+  captureDeviceAtom,
   captureModeAtom,
   resolutionAtom,
   serialPortStateAtom,
+  sharpnessAtom,
   videoScaleAtom,
   videoStateAtom
 } from '@renderer/jotai/device'
 import { isKeyboardEnableAtom } from '@renderer/jotai/keyboard'
 import { mouseModeAtom, mouseStyleAtom } from '@renderer/jotai/mouse'
-import { ffmpegCamera } from '@renderer/libs/capture/ffmpeg-camera'
+import { captureCamera } from '@renderer/libs/capture/capture-camera'
 import { camera } from '@renderer/libs/media/camera'
 import { requestCameraPermission } from '@renderer/libs/media/permission'
 import * as storage from '@renderer/libs/storage'
@@ -35,6 +37,8 @@ const App = (): ReactElement => {
   const videoScale = useAtomValue(videoScaleAtom)
   const [videoState, setVideoState] = useAtom(videoStateAtom)
   const [captureMode, setCaptureMode] = useAtom(captureModeAtom)
+  const [captureDevice, setCaptureDevice] = useAtom(captureDeviceAtom)
+  const [sharpness, setSharpness] = useAtom(sharpnessAtom)
   const serialPortState = useAtomValue(serialPortStateAtom)
   const mouseMode = useAtomValue(mouseModeAtom)
   const mouseStyle = useAtomValue(mouseStyleAtom)
@@ -51,27 +55,18 @@ const App = (): ReactElement => {
     }
 
     setCaptureMode(storage.getCaptureMode())
+    setCaptureDevice(storage.getCaptureDevice())
+    setSharpness(storage.getSharpness())
     requestMediaPermissions(resolution)
 
     return (): void => {
       camera.close()
-      ffmpegCamera.close()
+      captureCamera.close()
       window.electron.ipcRenderer.invoke(IpcEvents.CLOSE_SERIAL_PORT)
     }
   }, [])
 
-  useEffect(() => {
-    console.log(
-      'capture-debug STATE captureMode=',
-      captureMode,
-      'videoState=',
-      videoState,
-      'serialPortState=',
-      serialPortState
-    )
-  }, [captureMode, videoState, serialPortState])
-
-  // Drive the FFmpeg uncompressed-capture path when capture mode is on.
+  // Drive the uncompressed-capture path when capture mode is on.
   // Depends on `resolution` so a resolution change cleanly restarts the session.
   useEffect(() => {
     if (state !== 'success') return
@@ -83,25 +78,27 @@ const App = (): ReactElement => {
       camera.close()
       const canvas = document.getElementById('video') as HTMLCanvasElement | null
       if (!canvas) return
-      ffmpegCamera
+      captureCamera
         .open({
           canvas,
           width: resolution.width,
           height: resolution.height,
           fps: fpsFor(resolution.width, resolution.height),
+          deviceName: captureDevice || undefined,
+          sharpness,
           onError: (msg) => failCapture(msg)
         })
         .then(() => setVideoState('connected'))
         .catch((err) => failCapture(err instanceof Error ? err.message : String(err)))
-      return (): void => ffmpegCamera.close()
+      return (): void => captureCamera.close()
     }
 
-    ffmpegCamera.close()
+    captureCamera.close()
     // Ticked -> unticked: restore the regular getUserMedia camera (the swapped-in
     // <video> element has no stream otherwise).
     if (wasCapture) reopenCamera()
     return
-  }, [captureMode, state, resolution])
+  }, [captureMode, state, resolution, captureDevice])
 
   // Uncompressed frames are structured-clone copied across processes; past
   // ~150 MB/s the copies crowd out input IPC on both event loops (1080p60 is
@@ -116,7 +113,7 @@ const App = (): ReactElement => {
   // regular camera path; serial (keyboard/mouse) is unaffected.
   function failCapture(msg: string): void {
     console.error('capture error:', msg)
-    message.error(`Uncompressed capture failed: ${msg.slice(0, 300)}`, 8)
+    message.error(`${t('video.captureFailed')}: ${msg.slice(0, 300)}`, 8)
     setCaptureMode(false)
     storage.setCaptureMode(false)
   }
