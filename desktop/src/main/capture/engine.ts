@@ -1,13 +1,13 @@
-// Uncompressed (YUY2/yuvs) capture — macOS Phase 1. Spawns the bundled
-// nanokvm-capture Swift helper (native AVFoundation; ffmpeg's avfoundation
-// input freezes on >=1080p uncompressed frames), assembles exact-size raw
-// frames (O(n) fill buffer — a naive Buffer.concat is O(n^2) and throttles the
-// pipeline), and pushes each frame to the renderer over a MessagePortMain.
-import { ChildProcessWithoutNullStreams, execFile, spawn } from 'child_process'
-import { existsSync } from 'fs'
-import { join } from 'path'
+// Uncompressed (YUY2/yuyv422) capture engine. A platform backend (see
+// backends.ts) enumerates devices and provides a capture process that writes
+// raw frames to stdout; this module assembles exact-size frames (O(n) fill
+// buffer — a naive Buffer.concat is O(n^2) and throttles the pipeline) and
+// pushes each one to the renderer over a MessagePortMain.
+import { ChildProcessWithoutNullStreams, spawn } from 'child_process'
 import { performance } from 'perf_hooks'
 import type { MessagePortMain } from 'electron'
+
+import { pickBackend } from './backends'
 
 export type CaptureDevice = { index: number; name: string }
 export type CaptureOptions = {
@@ -19,85 +19,69 @@ export type CaptureOptions = {
   requestId?: number
 }
 export type Mode = { width: number; height: number; fps: number[] }
-// device is the AVFoundation device NAME: indices are not stable — Continuity
-// cameras (iPhone/Desk View) insert and remove themselves and shift the list.
+// device is the backend-specific id: AVFoundation/DirectShow device NAME
+// (indices are not stable — e.g. Continuity cameras shift the macOS list),
+// or the /dev/videoN path on Linux.
 export type ResolvedCapture = { device: string; width: number; height: number; fps: number }
-
-const HELPER_CANDIDATES = [
-  process.env.NANOKVM_CAPTURE_PATH,
-  // packaged: resources/ is asarUnpacked (binaries can't execute from asar)
-  join(__dirname, '../../resources/nanokvm-capture').replace('app.asar', 'app.asar.unpacked')
-].filter(Boolean) as string[]
-
-function helperPath(): string {
-  const p = HELPER_CANDIDATES.find((c) => existsSync(c))
-  if (!p) throw new Error('nanokvm-capture helper not found (build it with pnpm build:capture)')
-  return p
+export type StreamSpec = {
+  command: string
+  args: string[]
+  // true: the process reports actually-delivered dimensions via a stderr
+  // "META {json}" line before frames flow (the capture stack may serve the
+  // signal-native mode regardless of the request). false: frames are exactly
+  // the requested size, and the first stdout data signals a healthy start.
+  awaitMeta: boolean
 }
+export type Backend = {
+  listDevices(): Promise<{ id: string; name: string }[]>
+  listModes(id: string): Promise<Mode[]>
+  streamSpec(resolved: ResolvedCapture): StreamSpec
+}
+
+const backend = pickBackend()
 
 const nowAbs = (): number => performance.timeOrigin + performance.now()
 
-type HelperFormat = { pixfmt: string; width: number; height: number; fps: number[] }
-type HelperDevice = { name: string; formats: HelperFormat[] }
-
-function listAll(): Promise<HelperDevice[]> {
-  return new Promise((resolve) => {
-    execFile(helperPath(), ['list'], (_err, stdout) => {
-      try {
-        resolve(JSON.parse(stdout).devices as HelperDevice[])
-      } catch {
-        resolve([])
-      }
-    })
-  })
-}
-
 /** Enumerate video capture devices. */
 export async function listDevices(): Promise<CaptureDevice[]> {
-  return (await listAll()).map((d, index) => ({ index, name: d.name }))
+  return (await backend.listDevices()).map((d, index) => ({ index, name: d.name }))
 }
 
 /** Pick the most likely capture device when the caller doesn't specify one. */
-function autoPick(devices: HelperDevice[]): string {
-  const pref = devices.find(
-    (d) =>
-      /usb|video|capture|hdmi|kvm/i.test(d.name) &&
-      !/facetime|desk view|iphone|capture screen/i.test(d.name)
+function autoPick<T extends { name: string }>(devices: T[]): T | undefined {
+  return (
+    devices.find(
+      (d) =>
+        /usb|video|capture|hdmi|kvm/i.test(d.name) &&
+        !/facetime|desk view|iphone|capture screen/i.test(d.name)
+    ) || devices[0]
   )
-  return (pref || devices[0])?.name ?? ''
 }
 
 /**
  * Resolve a requested capture to a device + a mode the device advertises.
  * If the requested resolution isn't offered, fall back to the largest one.
- * Note the UVC stack may still serve the signal-native mode regardless — the
- * helper reports the ACTUAL dimensions when the stream starts.
  */
 export async function resolveCapture(opts: CaptureOptions): Promise<ResolvedCapture> {
-  const devices = await listAll()
+  const devices = await backend.listDevices()
   const byName = opts.deviceName ? devices.find((d) => d.name === opts.deviceName) : undefined
   const byIndex = opts.deviceIndex !== undefined ? devices[opts.deviceIndex] : undefined
-  const device = byName?.name || byIndex?.name || autoPick(devices)
+  const device = byName || byIndex || autoPick(devices)
   if (!device) throw new Error('no capture device found')
 
-  const modes = new Map<string, Mode>()
-  for (const f of devices.find((d) => d.name === device)?.formats ?? []) {
-    if (f.pixfmt !== 'yuvs') continue
-    const key = `${f.width}x${f.height}`
-    const mode = modes.get(key) || { width: f.width, height: f.height, fps: [] }
-    for (const v of f.fps) if (v && !mode.fps.includes(v)) mode.fps.push(v)
-    modes.set(key, mode)
-  }
+  const modes = await backend.listModes(device.id)
 
   let { width, height } = opts
-  let mode = modes.get(`${width}x${height}`)
-  if (!mode && modes.size) {
-    mode = [...modes.values()].reduce((a, b) => (b.width * b.height > a.width * a.height ? b : a))
+  let mode = modes.find((m) => m.width === width && m.height === height)
+  if (!mode && modes.length) {
+    mode = modes.reduce((a, b) => (b.width * b.height > a.width * a.height ? b : a))
     width = mode.width
     height = mode.height
   }
 
   // Highest advertised fps <= requested (small tolerance), else the lowest.
+  // Backends that don't report per-mode rates (v4l2) leave fps empty and the
+  // driver clamps the requested rate itself.
   let fps = opts.fps
   if (mode && mode.fps.length) {
     const candidates = [...mode.fps].sort((a, b) => a - b)
@@ -105,7 +89,7 @@ export async function resolveCapture(opts: CaptureOptions): Promise<ResolvedCapt
     fps = atMost.length ? atMost[atMost.length - 1] : candidates[0]
   }
 
-  return { device, width, height, fps }
+  return { device: device.id, width, height, fps }
 }
 
 export class CaptureSession {
@@ -113,8 +97,9 @@ export class CaptureSession {
   private stopping = false
 
   /**
-   * Spawn the helper and resolve with the ACTUAL frame dimensions (from its
-   * META line) once the first frame is captured. Frames then flow to `port`.
+   * Spawn the capture process and resolve with the frame dimensions once the
+   * stream is up (META line, or first data for exact-size backends). Frames
+   * then flow to `port`.
    */
   start(
     port: MessagePortMain,
@@ -123,18 +108,8 @@ export class CaptureSession {
   ): Promise<{ width: number; height: number }> {
     this.stopping = false
 
-    const args = [
-      'stream',
-      '--device',
-      opts.device,
-      '--width',
-      String(opts.width),
-      '--height',
-      String(opts.height),
-      '--fps',
-      String(opts.fps)
-    ]
-    const proc = spawn(helperPath(), args)
+    const spec = backend.streamSpec(opts)
+    const proc = spawn(spec.command, spec.args)
     this.proc = proc
 
     return new Promise((resolve, reject) => {
@@ -149,8 +124,15 @@ export class CaptureSession {
         }
       }, 10000)
 
+      const begin = (width: number, height: number): void => {
+        started = true
+        clearTimeout(startupTimeout)
+        attachPump(width, height)
+        resolve({ width, height })
+      }
+
       const attachPump = (width: number, height: number): void => {
-        const frameBytes = width * height * 2 // yuvs
+        const frameBytes = width * height * 2 // yuyv422
         const frameBuf = Buffer.allocUnsafe(frameBytes)
         let filled = 0
 
@@ -202,24 +184,31 @@ export class CaptureSession {
         })
       }
 
-      proc.stderr.on('data', (d: Buffer) => {
-        const text = d.toString()
-        const meta = text.match(/^META\s+(\{.*\})/m)
-        if (meta && !started) {
-          started = true
-          clearTimeout(startupTimeout)
-          try {
-            const { width, height } = JSON.parse(meta[1])
-            attachPump(width, height)
-            resolve({ width, height })
-          } catch (e) {
-            this.stop()
-            reject(e)
+      if (spec.awaitMeta) {
+        proc.stderr.on('data', (d: Buffer) => {
+          const text = d.toString()
+          const meta = text.match(/^META\s+(\{.*\})/m)
+          if (meta && !started) {
+            try {
+              const { width, height } = JSON.parse(meta[1])
+              begin(width, height)
+            } catch (e) {
+              this.stop()
+              clearTimeout(startupTimeout)
+              reject(e)
+            }
+            return
           }
-          return
-        }
-        stderr += text
-      })
+          stderr += text
+        })
+      } else {
+        proc.stderr.on('data', (d: Buffer) => {
+          stderr += d.toString()
+        })
+        proc.stdout.once('data', () => {
+          if (!started) begin(opts.width, opts.height)
+        })
+      }
 
       proc.on('close', () => {
         const wasCurrent = this.proc === proc
@@ -235,8 +224,15 @@ export class CaptureSession {
       })
       proc.on('error', (e) => {
         clearTimeout(startupTimeout)
-        if (started) onError(e.message)
-        else reject(e)
+        const err = e as NodeJS.ErrnoException
+        const msg =
+          err.code === 'ENOENT'
+            ? spec.awaitMeta
+              ? `capture helper not found: ${spec.command}`
+              : 'FFmpeg not found — install FFmpeg or set FFMPEG_PATH'
+            : e.message
+        if (started) onError(msg)
+        else reject(new Error(msg))
       })
     })
   }
@@ -246,10 +242,15 @@ export class CaptureSession {
     if (this.proc) {
       const proc = this.proc
       this.proc = null
-      // SIGINT lets the helper tear down the AVFoundation session cleanly —
-      // hard kills can wedge the capture device / camera daemon.
+      // Graceful first: SIGINT lets the process tear down the capture session
+      // cleanly (hard kills can wedge the device / camera daemon). On Windows
+      // there are no signals — ffmpeg quits on 'q' via stdin.
       try {
-        proc.kill('SIGINT')
+        if (process.platform === 'win32') {
+          proc.stdin.write('q')
+        } else {
+          proc.kill('SIGINT')
+        }
       } catch {
         /* already gone */
       }
