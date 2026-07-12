@@ -3,17 +3,16 @@
 // path, which delivers raw frames that a plain <video> can't display.
 //
 // Two-pass for display quality: pass 1 converts YUY2→RGB at source size into a
-// framebuffer texture; pass 2 blits it with LINEAR filtering to a canvas buffer
-// at 2x source size. The browser then bilinearly *downscales* to the displayed
-// size, which stays sharp — a direct nearest/bilinear upscale of the source
-// buffer looks jagged/soft at non-integer HiDPI scale factors.
-
-const SUPERSAMPLE = 2
+// framebuffer texture; pass 2 resamples it with Catmull-Rom bicubic directly
+// into a canvas buffer matched to the element's PHYSICAL pixel size
+// (clientWidth × devicePixelRatio). Rendering 1:1 with the display and using
+// bicubic (instead of bilinear, which smears text) keeps fractional upscales
+// as crisp as they can be — the browser never resamples the result.
 
 const VERT = `#version 300 es
 void main(){ vec2 v[3]=vec2[3](vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.)); gl_Position=vec4(v[gl_VertexID],0.,1.); }`
 
-const FRAG = `#version 300 es
+const FRAG_YUV = `#version 300 es
 precision highp float; precision highp int;
 uniform highp usampler2D tex; uniform int uH;
 out vec4 frag;
@@ -27,8 +26,64 @@ void main(){
   frag=vec4(clamp(vec3(r,g,b)/255.0,0.0,1.0),1.0);
 }`
 
+// Catmull-Rom bicubic via 9 bilinear fetches (Jimenez).
+const FRAG_SCALE = `#version 300 es
+precision highp float;
+uniform sampler2D tex; uniform vec2 uSrcSize; uniform vec2 uOutSize;
+out vec4 frag;
+vec4 catmullRom(vec2 uv){
+  vec2 samplePos = uv * uSrcSize;
+  vec2 texPos1 = floor(samplePos - 0.5) + 0.5;
+  vec2 f = samplePos - texPos1;
+  vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+  vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+  vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+  vec2 w3 = f * f * (-0.5 + 0.5 * f);
+  vec2 w12 = w1 + w2;
+  vec2 tc0 = (texPos1 - 1.0) / uSrcSize;
+  vec2 tc3 = (texPos1 + 2.0) / uSrcSize;
+  vec2 tc12 = (texPos1 + w2 / w12) / uSrcSize;
+  vec4 r = vec4(0.0);
+  r += texture(tex, vec2(tc0.x,  tc0.y))  * w0.x  * w0.y;
+  r += texture(tex, vec2(tc12.x, tc0.y))  * w12.x * w0.y;
+  r += texture(tex, vec2(tc3.x,  tc0.y))  * w3.x  * w0.y;
+  r += texture(tex, vec2(tc0.x,  tc12.y)) * w0.x  * w12.y;
+  r += texture(tex, vec2(tc12.x, tc12.y)) * w12.x * w12.y;
+  r += texture(tex, vec2(tc3.x,  tc12.y)) * w3.x  * w12.y;
+  r += texture(tex, vec2(tc0.x,  tc3.y))  * w0.x  * w3.y;
+  r += texture(tex, vec2(tc12.x, tc3.y))  * w12.x * w3.y;
+  r += texture(tex, vec2(tc3.x,  tc3.y))  * w3.x  * w3.y;
+  return r;
+}
+void main(){
+  // pass-1 output is already display-oriented; sample straight through
+  vec2 uv = gl_FragCoord.xy / uOutSize;
+  vec3 c = clamp(catmullRom(uv).rgb, 0.0, 1.0);
+
+  // Contrast-adaptive sharpening (AMD CAS-style): sharpen flat/low-contrast
+  // areas, back off at already-hard edges to avoid halos.
+  vec2 d = 1.0 / uOutSize;
+  vec3 n = texture(tex, uv + vec2( 0.0, -d.y)).rgb;
+  vec3 s = texture(tex, uv + vec2( 0.0,  d.y)).rgb;
+  vec3 e = texture(tex, uv + vec2( d.x,  0.0)).rgb;
+  vec3 w = texture(tex, uv + vec2(-d.x,  0.0)).rgb;
+  vec3 mn = min(min(min(n, s), min(e, w)), c);
+  vec3 mx = max(max(max(n, s), max(e, w)), c);
+  vec3 amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0));
+  float sharpness = 0.5;                       // 0..1
+  vec3 wgt = amp * (-1.0 / mix(8.0, 5.0, sharpness));
+  vec3 outc = ((n + s + e + w) * wgt + c) / (4.0 * wgt + 1.0);
+
+  frag = vec4(clamp(outc, 0.0, 1.0), 1.0);
+}`
+
 export class YuvRenderer {
   private gl: WebGL2RenderingContext | null = null
+  private canvas: HTMLCanvasElement | null = null
+  private progYuv: WebGLProgram | null = null
+  private progScale: WebGLProgram | null = null
+  private uSrcSize: WebGLUniformLocation | null = null
+  private uOutSize: WebGLUniformLocation | null = null
   private tex: WebGLTexture | null = null
   private rgbTex: WebGLTexture | null = null
   private fbo: WebGLFramebuffer | null = null
@@ -36,20 +91,32 @@ export class YuvRenderer {
   private height = 0
 
   init(canvas: HTMLCanvasElement, width: number, height: number): boolean {
+    this.canvas = canvas
     this.width = width
     this.height = height
-    canvas.width = width * SUPERSAMPLE
-    canvas.height = height * SUPERSAMPLE
+    // Keep the element's box at the source aspect; the buffer follows the
+    // element's physical size (see syncSize) so display is always 1:1 pixels.
+    canvas.style.aspectRatio = `${width} / ${height}`
+    canvas.width = width
+    canvas.height = height
 
     const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false })
     if (!gl) return false
     this.gl = gl
 
-    const prog = this.link(gl, VERT, FRAG)
-    if (!prog) return false
-    gl.useProgram(prog)
-    gl.uniform1i(gl.getUniformLocation(prog, 'tex'), 0)
-    gl.uniform1i(gl.getUniformLocation(prog, 'uH'), height)
+    this.progYuv = this.link(gl, VERT, FRAG_YUV)
+    this.progScale = this.link(gl, VERT, FRAG_SCALE)
+    if (!this.progYuv || !this.progScale) return false
+
+    gl.useProgram(this.progYuv)
+    gl.uniform1i(gl.getUniformLocation(this.progYuv, 'tex'), 0)
+    gl.uniform1i(gl.getUniformLocation(this.progYuv, 'uH'), height)
+
+    gl.useProgram(this.progScale)
+    gl.uniform1i(gl.getUniformLocation(this.progScale, 'tex'), 0)
+    this.uSrcSize = gl.getUniformLocation(this.progScale, 'uSrcSize')
+    this.uOutSize = gl.getUniformLocation(this.progScale, 'uOutSize')
+    gl.uniform2f(this.uSrcSize, width, height)
 
     // Source YUY2 texture (integer, exact texel reads in the shader).
     // Immutable storage — per-frame uploads use texSubImage2D (no realloc).
@@ -61,7 +128,7 @@ export class YuvRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
 
-    // Intermediate RGB target at source size for the pass-2 linear blit.
+    // Intermediate RGB target at source size; LINEAR enables the 9-tap trick.
     this.rgbTex = gl.createTexture()
     gl.bindTexture(gl.TEXTURE_2D, this.rgbTex)
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
@@ -81,11 +148,26 @@ export class YuvRenderer {
     return true
   }
 
+  // Match the drawing buffer to the element's physical pixels.
+  private syncSize(): void {
+    const c = this.canvas
+    if (!c) return
+    const dpr = window.devicePixelRatio || 1
+    const w = Math.max(1, Math.round(c.clientWidth * dpr))
+    const h = Math.max(1, Math.round(c.clientHeight * dpr))
+    if (c.width !== w || c.height !== h) {
+      c.width = w
+      c.height = h
+    }
+  }
+
   render(frame: Uint8Array): void {
     const gl = this.gl
     if (!gl) return
+    this.syncSize()
 
     // Pass 1: YUY2 -> RGB at source size, into the FBO.
+    gl.useProgram(this.progYuv)
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo)
     gl.viewport(0, 0, this.width, this.height)
     gl.bindTexture(gl.TEXTURE_2D, this.tex)
@@ -102,21 +184,15 @@ export class YuvRenderer {
     )
     gl.drawArrays(gl.TRIANGLES, 0, 3)
 
-    // Pass 2: linear blit up to the supersampled backbuffer.
-    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this.fbo)
-    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null)
-    gl.blitFramebuffer(
-      0,
-      0,
-      this.width,
-      this.height,
-      0,
-      0,
-      this.width * SUPERSAMPLE,
-      this.height * SUPERSAMPLE,
-      gl.COLOR_BUFFER_BIT,
-      gl.LINEAR
-    )
+    // Pass 2: bicubic resample to the physical-pixel backbuffer.
+    const outW = gl.drawingBufferWidth
+    const outH = gl.drawingBufferHeight
+    gl.useProgram(this.progScale)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.viewport(0, 0, outW, outH)
+    gl.uniform2f(this.uOutSize, outW, outH)
+    gl.bindTexture(gl.TEXTURE_2D, this.rgbTex)
+    gl.drawArrays(gl.TRIANGLES, 0, 3)
   }
 
   // TEMP (debug): read back one pixel from the drawn backbuffer to prove the
@@ -126,11 +202,17 @@ export class YuvRenderer {
     const gl = this.gl
     if (!gl) return 'no-gl'
     if (gl.isContextLost()) return 'CONTEXT-LOST'
-    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null) // read the displayed backbuffer
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null)
     const px = new Uint8Array(4)
-    const cx = Math.floor((this.width * SUPERSAMPLE) / 2)
-    const cy = Math.floor((this.height * SUPERSAMPLE) / 2)
-    gl.readPixels(cx, cy, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px)
+    gl.readPixels(
+      Math.floor(gl.drawingBufferWidth / 2),
+      Math.floor(gl.drawingBufferHeight / 2),
+      1,
+      1,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      px
+    )
     const err = gl.getError()
     return `px=${px.join(',')}${err ? ` glErr=${err}` : ''}`
   }
@@ -143,6 +225,7 @@ export class YuvRenderer {
       if (this.fbo) gl.deleteFramebuffer(this.fbo)
     }
     this.gl = null
+    this.canvas = null
     this.tex = null
     this.rgbTex = null
     this.fbo = null
