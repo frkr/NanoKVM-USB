@@ -46,6 +46,7 @@ const App = (): ReactElement => {
   const [resolution, setResolution] = useAtom(resolutionAtom)
 
   const [state, setState] = useState<State>('loading')
+  const [captureNonce, setCaptureNonce] = useState(0)
   const prevCaptureMode = useRef(false)
 
   useEffect(() => {
@@ -86,7 +87,14 @@ const App = (): ReactElement => {
           fps: fpsFor(resolution.width, resolution.height),
           deviceName: captureDevice || undefined,
           sharpness,
-          onError: (msg) => failCapture(msg)
+          onError: (msg) => {
+            if (/video mode changed/i.test(msg)) {
+              // HDMI source resolution changed — restart at the new mode
+              setTimeout(() => setCaptureNonce((n) => n + 1), 500)
+            } else {
+              failCapture(msg)
+            }
+          }
         })
         .then(() => setVideoState('connected'))
         .catch((err) => failCapture(err instanceof Error ? err.message : String(err)))
@@ -98,7 +106,7 @@ const App = (): ReactElement => {
     // <video> element has no stream otherwise).
     if (wasCapture) reopenCamera()
     return
-  }, [captureMode, state, resolution, captureDevice])
+  }, [captureMode, state, resolution, captureDevice, captureNonce])
 
   // Uncompressed frames are structured-clone copied across processes; past
   // ~150 MB/s the copies crowd out input IPC on both event loops (1080p60 is

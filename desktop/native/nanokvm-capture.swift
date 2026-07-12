@@ -51,7 +51,14 @@ func listCommand() {
 }
 
 final class Writer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-  var metaSent = false
+  // The device may deliver a few transitional frames at a stale mode right
+  // after opening — only report META once dimensions are stable, and treat a
+  // later mode change (e.g. the HDMI source resolution changed) as a restart
+  // condition (exit 3) so every emitted frame matches META exactly.
+  var stableW = 0
+  var stableH = 0
+  var stableCount = 0
+  var locked = false
   func captureOutput(_: AVCaptureOutput, didOutput sb: CMSampleBuffer, from _: AVCaptureConnection) {
     guard let pb = CMSampleBufferGetImageBuffer(sb) else { return }
     CVPixelBufferLockBaseAddress(pb, .readOnly)
@@ -63,9 +70,21 @@ final class Writer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     let stride = CVPixelBufferGetBytesPerRow(pb)
     let rowBytes = w * 2 // yuvs = 2 bytes/pixel
 
-    if !metaSent {
-      metaSent = true
+    if !locked {
+      if w == stableW && h == stableH {
+        stableCount += 1
+      } else {
+        stableW = w
+        stableH = h
+        stableCount = 1
+      }
+      if stableCount < 3 { return } // drop pre-stable frames
+      locked = true
       FileHandle.standardError.write("META {\"width\":\(w),\"height\":\(h)}\n".data(using: .utf8)!)
+    } else if w != stableW || h != stableH {
+      FileHandle.standardError.write(
+        "ERROR video mode changed (\(stableW)x\(stableH) -> \(w)x\(h))\n".data(using: .utf8)!)
+      exit(3)
     }
 
     if stride == rowBytes {
