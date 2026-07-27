@@ -36,6 +36,7 @@
     "i18next": "^24.2.2",
     "jotai": "^2.12.1",
     "lucide-react": "^0.476.0",
+    "ms": "^2.1.3",
     "react-draggable": "^4.5.0",
     "react-i18next": "^15.4.1",
     "react-responsive": "^10.0.0",

@@ -85,16 +85,9 @@ class SerialPort {
         cfmakeraw(&tty)
         tty.c_cflag |= tcflag_t(CS8 | CLOCAL | CREAD)
         tty.c_cflag &= ~tcflag_t(PARENB | CSTOPB)
-        withUnsafeMutablePointer(to: &tty.c_cc) {
-            let p = UnsafeMutableRawPointer($0).assumingMemoryBound(to: cc_t.self)
-            p[Int(VMIN)] = 0; p[Int(VTIME)] = 5
-        }
         tcsetattr(fd, TCSANOW, &tty)
-        let flags = fcntl(fd, F_GETFL)
-        _ = fcntl(fd, F_SETFL, flags & ~O_NONBLOCK)
-        // Drain any pending data instead of blocking sleep
-        var drain = [UInt8](repeating: 0, count: 64)
-        _ = Darwin.read(fd, &drain, drain.count)
+        // Flush any pending rx buffer instantly without blocking
+        tcflush(fd, TCIFLUSH)
         return true
     }
     func close() {
@@ -117,9 +110,10 @@ class SerialPort {
             let written = sendBuf.withUnsafeBufferPointer {
                 Darwin.write(self.fd, $0.baseAddress!, len)
             }
-            if written < 0 {
+            let err = errno
+            if written < 0 && err != EAGAIN && err != EWOULDBLOCK {
                 Darwin.close(self.fd); self.fd = -1
-                DispatchQueue.main.async { print("Serial: device disconnected") }
+                DispatchQueue.main.async { print("Serial: device disconnected (errno: \(err))") }
             }
         }
     }
@@ -132,15 +126,31 @@ class SerialPort {
                 DispatchQueue.main.async { completion(nil) }
                 return
             }
+            tcflush(self.fd, TCIFLUSH)
             var b = [UInt8](repeating: 0, count: 32)
             b[0]=0x57;b[1]=0xAB;b[2]=0x00;b[3]=0x01;b[4]=0x01;b[5]=0x00
             var s: UInt32 = 0
             for i in 0..<6 { s += UInt32(b[i]) }
             b[6] = UInt8(s & 0xFF)
             _ = b.withUnsafeBufferPointer { Darwin.write(fd, $0.baseAddress!, 7) }
-            var resp = [UInt8](repeating: 0, count: 8)
-            let result = Darwin.read(fd, &resp, 8) == 8 ? resp : nil
-            DispatchQueue.main.async { completion(result) }
+            DispatchQueue.global(qos: .utility).async { [self] in
+                guard self.fd >= 0 else { DispatchQueue.main.async { completion(nil) }; return }
+                var totalRead = 0
+                var resp = [UInt8](repeating: 0, count: 8)
+                let start = CFAbsoluteTimeGetCurrent()
+                while totalRead < 8 && CFAbsoluteTimeGetCurrent() - start < 0.2 {
+                    usleep(10000)
+                    guard self.fd >= 0 else { break }
+                    let n = resp.withUnsafeMutableBufferPointer { bp in
+                        Darwin.read(self.fd, bp.baseAddress! + totalRead, 8 - totalRead)
+                    }
+                    if n > 0 {
+                        totalRead += n
+                    }
+                }
+                let result = totalRead == 8 ? resp : nil
+                DispatchQueue.main.async { completion(result) }
+            }
         }
     }
 }
@@ -203,6 +213,95 @@ class MouseHID {
         switch b {
         case 0: return 0x01; case 1: return 0x02; case 2: return 0x04
         case 3: return 0x08; case 4: return 0x10; default: return 0
+        }
+    }
+}
+
+// MARK: - Mouse Jiggler (Figure-8 / Lemniscate pattern identical to browser/desktop client)
+class MouseJiggler {
+    private var lastMoveTime: Date = Date()
+    private var timer: Timer?
+    private var isJigglingEnabled = false
+    private var isAnimating = false
+    private var figure8Step = 0
+    private let FIGURE8_STEPS = 24
+    private let BASE_AMPLITUDE: Double = 35.0
+    weak var app: AppDelegate?
+
+    func setMode(_ enabled: Bool) {
+        isJigglingEnabled = enabled
+        if !enabled {
+            timer?.invalidate()
+            timer = nil
+        } else if timer == nil {
+            lastMoveTime = Date()
+            let t = Timer(timeInterval: 3.0, repeats: true) { [weak self] _ in
+                self?.timeoutCallback()
+            }
+            RunLoop.main.add(t, forMode: .common)
+            timer = t
+        }
+    }
+
+    func moveEventCallback() {
+        if isJigglingEnabled {
+            lastMoveTime = Date()
+        }
+    }
+
+    private func timeoutCallback() {
+        guard isJigglingEnabled, !isAnimating, let app = app, app.serial.isOpen else { return }
+        let idleThreshold = Double.random(in: 30.0...60.0)
+        if Date().timeIntervalSince(lastMoveTime) > idleThreshold {
+            lastMoveTime = Date().addingTimeInterval(-1.0)
+            Task {
+                await sendJiggle()
+            }
+        }
+    }
+
+    @MainActor
+    private func sendJiggle() async {
+        guard !isAnimating, let app = app, app.serial.isOpen else { return }
+        isAnimating = true
+        defer { isAnimating = false }
+
+        let totalDuration = Double.random(in: 5.0...10.0)
+        let amp = BASE_AMPLITUDE + Double.random(in: -6.0...6.0)
+        let vertical = Bool.random()
+        let loopStepsCount = Int(Double(FIGURE8_STEPS + 1) + Double.random(in: 0...Double(FIGURE8_STEPS - 2)))
+
+        let minDelay = 0.02
+        let extra = max(0, totalDuration - minDelay * Double(loopStepsCount))
+        let weights = (0..<loopStepsCount).map { _ in Double.random(in: 0.001...1.0) }
+        let sumWeights = weights.reduce(0, +)
+        let delays = weights.map { minDelay + ($0 / sumWeights) * extra }
+
+        for i in 0..<loopStepsCount {
+            guard isJigglingEnabled, app.serial.isOpen else { break }
+
+            let t = (Double(figure8Step) / Double(FIGURE8_STEPS)) * 2.0 * .pi
+            let tNext = (Double(figure8Step + 1) / Double(FIGURE8_STEPS)) * 2.0 * .pi
+
+            let sinT = amp * sin(t)
+            let sin2T = (amp * sin(2.0 * t)) / 2.0
+            let sinTNext = amp * sin(tNext)
+            let sin2TNext = (amp * sin(2.0 * tNext)) / 2.0
+
+            let x = vertical ? sin2T : sinT
+            let y = vertical ? sinT : sin2T
+            let xNext = vertical ? sin2TNext : sinTNext
+            let yNext = vertical ? sinTNext : sin2TNext
+
+            let dx = Int(round(xNext - x))
+            let dy = Int(round(yNext - y))
+
+            app.serial.sendMouseRelative(app.mouse.buildRelative(dx: dx, dy: dy))
+
+            figure8Step = (figure8Step + 1) % FIGURE8_STEPS
+
+            let delayNs = UInt64(delays[i] * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: delayNs)
         }
     }
 }
@@ -309,7 +408,7 @@ func findSerialPorts() -> [String] {
     guard let devs = try? fm.contentsOfDirectory(atPath: "/dev") else { return [] }
     var seen = Set<String>()
     var ports = [String]()
-    for prefix in ["cu.usbmodem", "cu.usbserial", "cu.usb"] {
+    for prefix in ["cu.usbmodem", "cu.usbserial", "cu.usb", "cu.wch", "cu.ch34", "tty.usbmodem", "tty.usbserial"] {
         for d in devs where d.hasPrefix(prefix) {
             let path = "/dev/" + d
             if seen.insert(path).inserted { ports.append(path) }
@@ -456,7 +555,7 @@ class VideoView: NSView {
     override func updateTrackingAreas() {
         trackingAreas.forEach { removeTrackingArea($0) }
         addTrackingArea(NSTrackingArea(rect: bounds,
-            options: [.activeInActiveApp, .mouseMoved, .inVisibleRect],
+            options: [.activeAlways, .mouseMoved, .inVisibleRect],
             owner: self, userInfo: nil))
         super.updateTrackingAreas()
     }
@@ -499,6 +598,7 @@ class VideoView: NSView {
 
     private func handleMove(_ event: NSEvent) {
         guard let app = app, app.serial.isOpen, !app.isResizing else { return }
+        app.mouseJiggler.moveEventCallback()
         let viewLoc = convert(event.locationInWindow, from: nil)
         guard bounds.contains(viewLoc) else { return }
         if Config.mouseAbsolute {
@@ -522,27 +622,32 @@ class VideoView: NSView {
 
     private func handleDown(_ event: NSEvent) {
         guard let app = app, app.serial.isOpen, !app.isResizing else { return }
+        app.mouseJiggler.moveEventCallback()
         let viewLoc = convert(event.locationInWindow, from: nil)
         guard bounds.contains(viewLoc) else { return }
         app.mouse.buttonDown(event.buttonNumber)
         if Config.mouseAbsolute {
             if let pos = pixelToNorm(viewLoc.x, bounds.height - viewLoc.y, app.rRect, app.rRectInvW, app.rRectInvH) {
-                app.lastPos = pos; app.pendingMove = pos
+                app.lastPos = pos
+                app.serial.sendMouseAbsolute(app.mouse.build(nx: pos.0, ny: pos.1))
+                app.pendingMove = nil
             }
         } else {
-            app.pendingButtonChange = true
+            app.serial.sendMouseRelative(app.mouse.buildRelative(dx: 0, dy: 0))
+            app.pendingButtonChange = false
         }
     }
 
     private func handleUp(_ event: NSEvent) {
         guard let app = app, app.serial.isOpen, !app.isResizing else { return }
-        let viewLoc = convert(event.locationInWindow, from: nil)
-        guard bounds.contains(viewLoc) else { return }
+        app.mouseJiggler.moveEventCallback()
         app.mouse.buttonUp(event.buttonNumber)
         if Config.mouseAbsolute {
-            app.pendingMove = app.lastPos
+            app.serial.sendMouseAbsolute(app.mouse.build(nx: app.lastPos.0, ny: app.lastPos.1))
+            app.pendingMove = nil
         } else {
-            app.pendingButtonChange = true
+            app.serial.sendMouseRelative(app.mouse.buildRelative(dx: 0, dy: 0))
+            app.pendingButtonChange = false
         }
     }
 
@@ -624,7 +729,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     var mouseFlushTimer: Timer?
 
     // Mouse jiggler
-    var jigglerTimer: Timer?
+    let mouseJiggler = MouseJiggler()
     var isJiggling = false
 
     // Paste state
@@ -658,6 +763,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let savedQuality = UserDefaults.standard.integer(forKey: "screenshotQuality")
         if savedQuality > 0 { screenshotQuality = Double(savedQuality) / 100.0 }
         setupSerial(); setupCapture(); setupWindow()
+        mouseJiggler.app = self
         if serial.isOpen { startMouseFlush() }
     }
 
@@ -1558,27 +1664,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     @objc func toggleJiggler(_ sender: Any?) {
-        if isJiggling {
-            jigglerTimer?.invalidate()
-            jigglerTimer = nil
-            isJiggling = false
-            print("Jiggler stopped")
-        } else {
-            isJiggling = true
-            let t = Timer(timeInterval: 30.0, repeats: true) {
-                [weak self] _ in
-                guard let self = self, self.serial.isOpen else { return }
-                let nx = self.lastPos.0, ny = self.lastPos.1
-                let jig = (nx > 0.5) ? -0.001 : 0.001
-                self.serial.sendMouseAbsolute(self.mouse.build(nx: nx + jig, ny: ny))
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    self.serial.sendMouseAbsolute(self.mouse.build(nx: nx, ny: ny))
-                }
-            }
-            RunLoop.main.add(t, forMode: .common)
-            jigglerTimer = t
-            print("Jiggler started (30s interval)")
+        isJiggling.toggle()
+        mouseJiggler.setMode(isJiggling)
+        if let item = sender as? NSMenuItem {
+            item.state = isJiggling ? .on : .off
         }
+        print("Jiggler \(isJiggling ? "started" : "stopped")")
     }
 
     // MARK: - Screenshot Actions
