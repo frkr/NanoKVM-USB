@@ -44,6 +44,9 @@ importers:
       lucide-react:
         specifier: ^0.476.0
         version: 0.476.0(react@18.3.1)
+      ms:
+        specifier: ^2.1.3
+        version: 2.1.3
       react-draggable:
         specifier: ^4.5.0
         version: 4.5.0(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
